@@ -165,7 +165,7 @@ class AuthViewSet(viewsets.ViewSet):
 
 class RankingView(APIView):
     def get(self, request):
-        # Mengambil data pendaftar dan kriteria
+        # Mengambil data pendaftar dan kriteriaz
         applicants = Applicant.objects.all()
         criteria = Criteria.objects.all()
 
