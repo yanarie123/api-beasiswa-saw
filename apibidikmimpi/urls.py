@@ -5,7 +5,7 @@ from django.contrib import admin
 from django.http import JsonResponse
 
 router = DefaultRouter()
-router.register(r'applicants', ApplicantViewSet)
+router.register(r'applicants', ApplicantViewSet, basename='applicant')
 router.register(r'criteria', CriteriaViewSet)
 # router.register(r'ranking', RankingView)
 router.register(r'auth', AuthViewSet, basename='auth')
