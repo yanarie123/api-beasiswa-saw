@@ -20,18 +20,13 @@ class ApplicantViewSet(viewsets.ModelViewSet):
         return Applicant.objects.filter(user=self.request.user)
     
     def create(self, request, *args, **kwargs):
-        if hasattr(request.user, "applicant"):
-            return Response(
-                {"error": "Applicant already exists for this user"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-    
-        serializer = self.get_serializer(data=request.data)
+        applicant, created = Applicant.objects.get_or_create(user=request.user)
+        
+        # Update data jika applicant sudah ada
+        serializer = self.get_serializer(applicant, data=request.data, partial=True)
         if serializer.is_valid():
-            app = serializer.save()
-            response_data = app.daya
-            response_data["id"] = app.id
-            return Response(response_data, status=status.HTTP_201_CREATED)
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_200_OK)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
     def update(self, request, *args, **kwargs):
@@ -48,7 +43,6 @@ class CriteriaViewSet(viewsets.ModelViewSet):
     queryset = Criteria.objects.all()
     serializer_class = CriteriaSerializer
 
-
 class AuthViewSet(viewsets.ViewSet):
     permission_classes = [AllowAny]
     
@@ -58,9 +52,10 @@ class AuthViewSet(viewsets.ViewSet):
         if serializer.is_valid():
             user = serializer.save()
             # Create associated Applicant
-            Applicant.objects.create(user=user)  # Menghapus field redundan
+            Applicant.objects.create(user=user)
             refresh = RefreshToken.for_user(user)
             return Response({
+                "status": True,
                 "message": "Registration successful",
                 "user": serializer.data,
                 "tokens": {
@@ -77,22 +72,92 @@ class AuthViewSet(viewsets.ViewSet):
 
         if not email or not password:
             return Response({
+                "status": False,
                 "error": "Please provide both email and password"
             }, status=status.HTTP_400_BAD_REQUEST)
 
+        # Cek apakah user ada
         try:
             user = User.objects.get(email=email)
         except User.DoesNotExist:
             return Response({
+                "status": False,
                 "error": "No user found with this email"
-            }, status=status.HTTP_404_NOT_FOUND)
+            }, status=status.HTTP_200_OK)
 
+        # Autentikasi password
         user = authenticate(email=email, password=password)
         
         if user:
             refresh = RefreshToken.for_user(user)
+            
+            # Default applicant_data = None
+            applicant_data = None
+            
             try:
                 applicant = user.applicant
+                
+                # ----- [Mulai] Tambahan logika untuk mengecek data SAW tidak null dan hitung score -----
+                # Pastikan kriteria yang ingin dihitung nilainya tidak `None`.
+                # Misalkan: average_score, parent_income, dependents, decent_house (atau yang lain sesuai model)
+                if (
+                    applicant.average_score is not None and
+                    applicant.parent_income is not None and
+                    applicant.dependents is not None and
+                    applicant.decent_house is not None
+                ):
+                    # Kita butuh semua applicant untuk mendapatkan nilai min dan max
+                    all_applicants = Applicant.objects.all()
+                    criteria = Criteria.objects.all()
+
+                    # Siapkan dictionary untuk menampung min dan max tiap kriteria
+                    max_values = {}
+                    min_values = {}
+
+                    for c in criteria:
+                        # Ambil semua nilai kriteria c.name dari setiap applicant (yang tidak None)
+                        values = [
+                            getattr(a, c.name) for a in all_applicants
+                            if getattr(a, c.name) is not None
+                        ]
+                        # Kalau values kosong, hindari ZeroDivisionError
+                        if not values:
+                            max_values[c.name] = 0
+                            min_values[c.name] = 0
+                        else:
+                            max_values[c.name] = max(values)
+                            min_values[c.name] = min(values)
+
+                    # Lakukan normalisasi untuk applicant yang sedang login
+                    total_score = 0
+                    for c in criteria:
+                        # Ambil nilai applicant saat ini
+                        val = getattr(applicant, c.name, 0) or 0
+
+                        # Hitung normalisasi
+                        if c.is_benefit:
+                            # val / max
+                            if max_values[c.name] != 0:
+                                norm = val / max_values[c.name]
+                            else:
+                                norm = 0
+                        else:
+                            # min / val
+                            # Pastikan val != 0 untuk hindari ZeroDivisionError
+                            if val != 0:
+                                norm = min_values[c.name] / val
+                            else:
+                                norm = 0
+                        
+                        # Bobot kali nilai normalisasi
+                        total_score += norm * c.weight
+                    
+                    saw_score = round(total_score, 4)
+                else:
+                    # Kalau data kriteria ada yang None, SAW tidak dihitung
+                    saw_score = None
+                # ----- [Selesai] Tambahan logika SAW -----
+
                 applicant_data = {
                     "id": applicant.id,
                     "name": applicant.user.name,
@@ -101,11 +166,14 @@ class AuthViewSet(viewsets.ViewSet):
                     "parent_income": applicant.parent_income,
                     "dependents": applicant.dependents,
                     "decent_house": applicant.get_decent_house_display(),
+                    # Tampilkan score jika tidak None
+                    "score": saw_score,
                 }
-            except (Applicant.DoesNotExist, Exception):
-                applicant_data = None
+            except Applicant.DoesNotExist:
+                pass  # applicant_data tetap None
 
             return Response({
+                "status": True,
                 "message": "Login successful",
                 "user": {
                     "id": user.id,
@@ -120,8 +188,9 @@ class AuthViewSet(viewsets.ViewSet):
             })
         
         return Response({
+            "status": False,
             "error": "Invalid credentials"
-        }, status=status.HTTP_401_UNAUTHORIZED)
+        }, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=["post"])
     def forgot_password(self, request):
@@ -194,29 +263,51 @@ class AuthViewSet(viewsets.ViewSet):
             )
 
 
+
 class RankingView(APIView):
     def get(self, request):
         applicants = Applicant.objects.select_related('user').all()
         criteria = Criteria.objects.all()
 
-        normalized_data = []
+        # Filter out applicants with any null values in criteria
+        valid_applicants = []
         for applicant in applicants:
+            is_valid = True
+            for criterion in criteria:
+                value = getattr(applicant, criterion.name, None)
+                if value is None:  # Skip if any value is null
+                    is_valid = False
+                    break
+            if is_valid:
+                valid_applicants.append(applicant)
+
+        # Prepare normalized data
+        normalized_data = []
+        for applicant in valid_applicants:
             norm = []
             for criterion in criteria:
+                values = [getattr(a, criterion.name, 0) for a in valid_applicants]
                 value = getattr(applicant, criterion.name, 0)
+                
                 if criterion.is_benefit:
-                    norm.append(value / max([getattr(a, criterion.name, 0) for a in applicants]))
+                    max_value = max(values) if max(values) > 0 else 1  # Avoid division by zero
+                    norm.append(value / max_value)
                 else:
-                    norm.append(min([getattr(a, criterion.name, 0) for a in applicants]) / value)
+                    min_value = min(values) if min(values) > 0 else 1  # Avoid division by zero
+                    norm.append(min_value / value if value > 0 else 0)  # Handle zero value
+
             normalized_data.append(norm)
 
+        # Calculate scores
         scores = []
         for norm in normalized_data:
             score = sum([n * c.weight for n, c in zip(norm, criteria)])
             scores.append(score)
 
-        results = sorted(zip(applicants, scores), key=lambda x: x[1], reverse=True)
+        # Sort results
+        results = sorted(zip(valid_applicants, scores), key=lambda x: x[1], reverse=True)
 
+        # Prepare ranking response
         ranking = []
         for index, (applicant, score) in enumerate(results, 1):
             ranking.append({
@@ -227,7 +318,10 @@ class RankingView(APIView):
                 "parent_income": applicant.parent_income,
                 "dependents": applicant.dependents,
                 "decent_house": applicant.get_decent_house_display(),
-                "score": score,
+                "score": round(score, 4),  # Rounded for better readability
             })
 
         return Response(ranking)
+
+
+
